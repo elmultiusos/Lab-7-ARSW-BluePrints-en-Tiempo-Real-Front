@@ -5,6 +5,20 @@ import { createSocket } from './lib/socketIoClient.js'
 const API_BASE = import.meta.env.VITE_API_BASE ?? 'http://localhost:8080' // Spring
 const IO_BASE  = import.meta.env.VITE_IO_BASE  ?? 'http://localhost:3001' // Node/Socket.IO
 
+// ============================================
+// LOGGING UTILITIES
+// ============================================
+const isDev = import.meta.env.DEV;
+
+const log = {
+  info: (msg, data) => isDev && console.log(`ℹ️  [INFO] ${msg}`, data || ''),
+  success: (msg, data) => isDev && console.log(`✅ [SUCCESS] ${msg}`, data || ''),
+  error: (msg, data) => console.error(`❌ [ERROR] ${msg}`, data || ''),
+  warn: (msg, data) => isDev && console.warn(`⚠️  [WARN] ${msg}`, data || ''),
+  socket: (msg, data) => isDev && console.log(`🔌 [SOCKET] ${msg}`, data || ''),
+  canvas: (msg, data) => isDev && console.log(`🎨 [CANVAS] ${msg}`, data || ''),
+}
+
 export default function App() {
   const [tech, setTech] = useState('socketio')
   const [author, setAuthor] = useState('juan')
@@ -12,6 +26,7 @@ export default function App() {
   const [blueprints, setBlueprints] = useState([])
   const [currentBp, setCurrentBp] = useState(null)
   const [newBpName, setNewBpName] = useState('')
+  const [connectionStatus, setConnectionStatus] = useState('disconnected')
   const canvasRef = useRef(null)
 
   const stompRef = useRef(null)
@@ -20,12 +35,17 @@ export default function App() {
 
   // Load blueprints list for the author
   const loadBlueprintsList = () => {
+    log.info(`Loading blueprints for author: ${author}`);
     fetch(`${tech==='stomp'?API_BASE:IO_BASE}/api/blueprints/${author}`)
       .then(r=>r.json())
       .then(list => {
         setBlueprints(list)
+        log.success(`Loaded ${list.length} blueprints for ${author}`);
       })
-      .catch(err => console.error('Error loading blueprints list:', err))
+      .catch(err => {
+        log.error('Error loading blueprints list', err)
+        console.error('Error loading blueprints list:', err)
+      })
   }
 
   useEffect(() => {
@@ -33,20 +53,28 @@ export default function App() {
   }, [tech, author])
 
   useEffect(() => {
+    log.info(`Fetching blueprint: ${author}/${name}`);
     fetch(`${tech==='stomp'?API_BASE:IO_BASE}/api/blueprints/${author}/${name}`)
       .then(r=>r.json())
       .then(bp => {
         setCurrentBp(bp)
         drawAll(bp)
+        log.success(`Blueprint loaded: ${author}/${name}`, { points: bp.points?.length || 0 });
       })
-      .catch(err => console.error('Error loading blueprint:', err))
+      .catch(err => {
+        log.error('Error loading blueprint', err)
+        console.error('Error loading blueprint:', err)
+      })
   }, [tech, author, name])
 
   function drawAll(bp) {
     const ctx = canvasRef.current?.getContext('2d')
     if (!ctx) return
     ctx.clearRect(0,0,600,400)
-    if (!bp || !bp.points || bp.points.length === 0) return
+    if (!bp || !bp.points || bp.points.length === 0) {
+      log.canvas('Canvas cleared - no points to draw');
+      return
+    }
     
     ctx.strokeStyle = '#2563eb'
     ctx.lineWidth = 2
@@ -66,6 +94,8 @@ export default function App() {
       ctx.arc(p.x, p.y, 3, 0, Math.PI * 2)
       ctx.fill()
     })
+    
+    log.canvas(`Drew ${bp.points.length} points on canvas`);
   }
 
   useEffect(() => {
@@ -74,42 +104,74 @@ export default function App() {
     socketRef.current?.disconnect?.(); socketRef.current = null
 
     if (tech === 'stomp') {
+      log.info('Initializing STOMP connection', { server: API_BASE });
+      setConnectionStatus('connecting');
       const client = createStompClient(API_BASE)
       stompRef.current = client
       client.onConnect = () => {
+        setConnectionStatus('connected');
+        log.success('STOMP connected', { server: API_BASE });
         unsubRef.current = subscribeBlueprint(client, author, name, (upd)=> {
           const bp = { author, name, points: upd.points }
           setCurrentBp(bp)
           drawAll(bp)
+          log.socket('Received blueprint update via STOMP', { points: upd.points.length });
         })
+        log.socket(`Subscribed to blueprint: ${author}/${name}`);
       }
       client.activate()
     } else {
+      log.info('Initializing Socket.IO connection', { server: IO_BASE });
+      setConnectionStatus('connecting');
       const s = createSocket(IO_BASE)
       socketRef.current = s
       const room = `blueprints.${author}.${name}`
+      
+      s.on('connect', () => {
+        setConnectionStatus('connected');
+        log.success('Socket.IO connected', { socketId: s.id, server: IO_BASE });
+      });
+      
+      s.on('disconnect', (reason) => {
+        setConnectionStatus('disconnected');
+        log.warn('Socket.IO disconnected', { reason });
+      });
+      
+      s.on('connect_error', (error) => {
+        setConnectionStatus('error');
+        log.error('Socket.IO connection error', error.message);
+      });
+      
       s.emit('join-room', room)
+      log.socket(`Joining room: ${room}`);
+      
       s.on('blueprint-update', (upd)=> {
         const bp = { author: upd.author, name: upd.name, points: upd.points }
         setCurrentBp(bp)
         drawAll(bp)
+        log.socket('Received blueprint-update', { author: upd.author, name: upd.name, points: upd.points.length });
       })
       s.on('blueprints-list-update', (data) => {
         if (data.author === author) {
+          log.socket('Received blueprints-list-update', { author: data.author });
           loadBlueprintsList()
         }
       })
     }
     return () => {
+      log.info('Cleaning up connections');
       unsubRef.current?.(); unsubRef.current = null
       stompRef.current?.deactivate?.()
       socketRef.current?.disconnect?.()
+      setConnectionStatus('disconnected');
     }
   }, [tech, author, name])
 
   function onClick(e) {
     const rect = e.target.getBoundingClientRect()
     const point = { x: Math.round(e.clientX - rect.left), y: Math.round(e.clientY - rect.top) }
+
+    log.canvas(`Point clicked: (${point.x}, ${point.y})`);
 
     // Immediately add point to local state and redraw
     const newPoints = [...(currentBp?.points || []), point]
@@ -119,15 +181,18 @@ export default function App() {
 
     if (tech === 'stomp' && stompRef.current?.connected) {
       stompRef.current.publish({ destination: '/app/draw', body: JSON.stringify({ author, name, point }) })
+      log.socket('Sent draw-event via STOMP', { point });
     } else if (tech === 'socketio' && socketRef.current?.connected) {
       const room = `blueprints.${author}.${name}`
       socketRef.current.emit('draw-event', { room, author, name, point })
+      log.socket('Sent draw-event via Socket.IO', { room, point });
     }
   }
 
   async function createBlueprint() {
     if (!newBpName.trim()) return alert('Por favor ingresa un nombre para el plano')
     
+    log.info(`Creating blueprint: ${author}/${newBpName}`);
     try {
       const response = await fetch(`${tech==='stomp'?API_BASE:IO_BASE}/api/blueprints`, {
         method: 'POST',
@@ -139,11 +204,14 @@ export default function App() {
         setNewBpName('')
         loadBlueprintsList()
         setName(newBpName)
+        log.success(`Blueprint created: ${author}/${newBpName}`);
       } else {
         const error = await response.json()
+        log.error(`Failed to create blueprint: ${error.error}`);
         alert(error.error || 'Error al crear el plano')
       }
     } catch (err) {
+      log.error('Error creating blueprint', err)
       console.error('Error creating blueprint:', err)
       alert('Error al crear el plano')
     }
@@ -152,6 +220,7 @@ export default function App() {
   async function saveBlueprint() {
     if (!currentBp) return
     
+    log.info(`Saving blueprint: ${author}/${name}`, { points: currentBp.points.length });
     try {
       const response = await fetch(`${tech==='stomp'?API_BASE:IO_BASE}/api/blueprints/${author}/${name}`, {
         method: 'PUT',
@@ -160,10 +229,12 @@ export default function App() {
       })
       
       if (response.ok) {
+        log.success(`Blueprint saved: ${author}/${name}`, { points: currentBp.points.length });
         alert('Plano guardado exitosamente')
         loadBlueprintsList()
       }
     } catch (err) {
+      log.error('Error saving blueprint', err)
       console.error('Error saving blueprint:', err)
       alert('Error al guardar el plano')
     }
@@ -172,12 +243,14 @@ export default function App() {
   async function deleteBlueprint() {
     if (!confirm(`¿Estás seguro de eliminar el plano "${name}"?`)) return
     
+    log.warn(`Deleting blueprint: ${author}/${name}`);
     try {
       const response = await fetch(`${tech==='stomp'?API_BASE:IO_BASE}/api/blueprints/${author}/${name}`, {
         method: 'DELETE'
       })
       
       if (response.ok || response.status === 204) {
+        log.success(`Blueprint deleted: ${author}/${name}`);
         alert('Plano eliminado exitosamente')
         loadBlueprintsList()
         // Load the first available blueprint or create a new one
@@ -189,12 +262,33 @@ export default function App() {
         }
       }
     } catch (err) {
+      log.error('Error deleting blueprint', err)
       console.error('Error deleting blueprint:', err)
       alert('Error al eliminar el plano')
     }
   }
 
   const totalPoints = currentBp?.points?.length || 0
+  
+  const getConnectionStatusColor = () => {
+    switch(connectionStatus) {
+      case 'connected': return '#10b981';
+      case 'connecting': return '#f59e0b';
+      case 'disconnected': return '#6b7280';
+      case 'error': return '#ef4444';
+      default: return '#6b7280';
+    }
+  };
+  
+  const getConnectionStatusText = () => {
+    switch(connectionStatus) {
+      case 'connected': return '● Conectado';
+      case 'connecting': return '⏳ Conectando...';
+      case 'disconnected': return '○ Desconectado';
+      case 'error': return '⚠️ Error';
+      default: return '○ Desconectado';
+    }
+  };
 
   return (
     <div style={{fontFamily:'Inter, system-ui', padding:16, maxWidth:1200}}>
@@ -221,6 +315,18 @@ export default function App() {
             <option key={bp.name} value={bp.name}>{bp.name}</option>
           ))}
         </select>
+        <div style={{
+          marginLeft:'auto',
+          padding:'4px 12px',
+          borderRadius:4,
+          fontSize:12,
+          fontWeight:'bold',
+          color: getConnectionStatusColor(),
+          border: `1px solid ${getConnectionStatusColor()}`,
+          backgroundColor: `${getConnectionStatusColor()}22`
+        }}>
+          {getConnectionStatusText()}
+        </div>
       </div>
 
       <div style={{display:'flex', gap:16, marginBottom:16}}>
